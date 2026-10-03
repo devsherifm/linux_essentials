@@ -15,27 +15,36 @@ A GitHub-friendly Markdown edition of the supplied **Linux Productivity & Engine
 ## 📊 Domain Overview
 
 ```mermaid
-flowchart TD
-    L[Linux Productivity Tools<br/>227 CLI Utilities]
-    L --> D1[Networking and Diagnostics<br/>27 tools]
-    L --> D2[System and Performance<br/>26 tools]
-    L --> D3[Data and Text Processing<br/>24 tools]
-    L --> D4[Terminal Visuals and UX<br/>23 tools]
-    L --> D5[Containers and Infra<br/>22 tools]
-    L --> D6[Shell and Productivity<br/>19 tools]
-    L --> D7[Dev and Versioning<br/>18 tools]
-    L --> D8[Security and Auditing<br/>18 tools]
-    L --> D9[Shell and Automation<br/>13 tools]
-    L --> D10[Shell and Navigation<br/>11 tools]
-    L --> D11[Networking and Transfer<br/>6 tools]
-    L --> D12[Networking and APIs<br/>4 tools]
-    L --> D13[System and Diagnostics<br/>4 tools]
-    L --> D14[Backup and Storage<br/>3 tools]
-    L --> D15[DevOps and CI/CD<br/>3 tools]
-    L --> D16[Security and Encryption<br/>3 tools]
-    L --> D17[Automation and Infra<br/>1 tools]
-    L --> D18[Data and Media<br/>1 tools]
-    L --> D19[Security and Permissions<br/>1 tools]
+mindmap
+  root((Linux Productivity Tools<br/>227 CLI Utilities))
+    Networking
+      Networking & Diagnostics — 27
+      Networking & Transfer — 6
+      Networking & APIs — 4
+    System
+      System & Performance — 26
+      System & Diagnostics — 4
+    Data
+      Data & Text Processing — 24
+      Data & Media — 1
+    Terminal UX
+      Terminal Visuals & UX — 23
+    Containers
+      Containers & Infra — 22
+    Shell
+      Shell & Productivity — 19
+      Shell & Automation — 13
+      Shell & Navigation — 11
+    Development
+      Dev & Versioning — 18
+      DevOps & CI/CD — 3
+      Automation & Infra — 1
+    Security
+      Security & Auditing — 18
+      Security & Encryption — 3
+      Security & Permissions — 1
+    Storage
+      Backup & Storage — 3
 ```
 
 ### Tool count by domain
