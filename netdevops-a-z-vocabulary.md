@@ -1742,36 +1742,7 @@ flowchart LR
 
 ## 🧱 A Practical NetDevOps Stack
 
-``` text
-                         ┌──────────────────┐
-                         │     NetDevOps     │
-                         └────────┬─────────┘
-                                  │
-             ┌────────────────────┼────────────────────┐
-             │                    │                    │
-       Source of Truth        Automation           Validation
-             │                    │                    │
-       NetBox / Nautobot     Ansible / AWX       pyATS / Batfish
-             │              Nornir / Scrapli          pytest
-             └────────────────────┼────────────────────┘
-                                  │
-                         APIs + Data Models
-                                  │
-                 NETCONF / RESTCONF / gNMI / YANG
-                                  │
-                    OpenConfig / Vendor Models
-                                  │
-              ┌───────────────────┴───────────────────┐
-              │                                       │
-          Network Control                         Telemetry
-       BGP / OSPF / IS-IS                    MDT / SNMP / Flow
-              │                                       │
-              └───────────────────┬───────────────────┘
-                                  │
-                           Git + CI/CD
-                                  │
-                           Production
-```
+![NetDevOps_Automation_Workflow_Diagram](images/NetDevOps_Automation_Workflow_Diagram.png)
 
 ---
 
@@ -1789,33 +1760,7 @@ flowchart LR
 
 ## 🎯 Suggested Learning Order
 
-``` text
-01  Networking Fundamentals
-        ↓
-02  Routing & Switching
-        ↓
-03  Python + Git
-        ↓
-04  Network APIs + YANG
-        ↓
-05  NetBox / Nautobot
-        ↓
-06  Ansible / AWX / Nornir
-        ↓
-07  Templates + Network as Code
-        ↓
-08  pyATS / Batfish / Validation
-        ↓
-09  CI/CD + GitOps
-        ↓
-10  Telemetry + Observability
-        ↓
-11  EVPN / VXLAN / MPLS / Segment Routing
-        ↓
-12  Intent + Closed-Loop Automation
-        ↓
-13  Production NetDevOps
-```
+![NetDevOps_Learning_Path_Roadmap](images/NetDevOps_Learning_Path_Roadmap.png)
 
 ---
 
