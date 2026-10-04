@@ -48,27 +48,56 @@
 ## 🧠 NetDevOps Mind Map
 
 ```mermaid
-mindmap
-  root((NetDevOps<br/>615 Terms))
-    Automation and Orchestration - 51
-    CI/CD and GitOps - 26
-    Cloud and Hybrid Networking - 17
-    Configuration and Network as Code - 39
-    Data Center and Fabric - 34
-    Data Models and Programmability - 31
-    Device Access and APIs - 37
-    Lab and Simulation - 19
-    Linux and Network OS - 23
-    Monitoring and Operations - 29
-    Network Architecture and Design - 22
-    Packet Processing and Linux Networking - 19
-    Provisioning and Lifecycle - 19
-    Routing and Control Plane - 49
-    Security and Access - 33
-    Service Provider and WAN - 40
-    Source of Truth and Inventory - 51
-    Telemetry and Observability - 36
-    Testing and Validation - 40
+flowchart LR
+
+    N["🌐 NETDEVOPS<br/><b>615 TERMS</b>"]
+
+    N --> A["⚙️ Automation<br/>& Orchestration<br/><b>51</b>"]
+    N --> B["📦 Source of Truth<br/>& Inventory<br/><b>51</b>"]
+    N --> C["🧪 Testing<br/>& Validation<br/><b>40</b>"]
+    N --> D["🔧 Configuration<br/>& Network as Code<br/><b>39</b>"]
+    N --> E["🧭 Routing<br/>& Control Plane<br/><b>49</b>"]
+    N --> F["🏢 Data Center<br/>& Fabric<br/><b>34</b>"]
+    N --> G["🌐 Service Provider<br/>& WAN<br/><b>40</b>"]
+    N --> H["🔐 Security<br/>& Access<br/><b>33</b>"]
+    N --> I["📡 Telemetry<br/>& Observability<br/><b>36</b>"]
+    N --> J["📊 Monitoring<br/>& Operations<br/><b>29</b>"]
+    N --> K["💻 Device Access<br/>& APIs<br/><b>26</b>"]
+    N --> L["🧩 Data Models<br/>& Programmability<br/><b>31</b>"]
+    N --> M["🐧 Linux<br/>& Network OS<br/><b>23</b>"]
+    N --> O["🧪 Lab<br/>& Simulation<br/><b>19</b>"]
+    N --> P["🚀 Provisioning<br/>& Lifecycle<br/><b>19</b>"]
+    N --> Q["🔄 CI/CD<br/>& GitOps<br/><b>26</b>"]
+    N --> R["☁️ Cloud<br/>& Hybrid Networking<br/><b>17</b>"]
+    N --> S["⚡ Packet Processing<br/>& Linux Networking<br/><b>19</b>"]
+    N --> T["🏗️ Network Architecture<br/>& Design<br/><b>22</b>"]
+
+    %% Core
+    style N fill:#0969da,color:#ffffff,stroke:#0550ae,stroke-width:3px
+
+    %% Categories
+    style A fill:#ddf4ff,stroke:#54aeff,color:#24292f
+    style B fill:#dcffe4,stroke:#4ac26b,color:#24292f
+    style C fill:#fff8c5,stroke:#d4a72c,color:#24292f
+    style D fill:#fbefff,stroke:#bf3989,color:#24292f
+    style E fill:#fbefff,stroke:#8250df,color:#24292f
+    style F fill:#fff1e5,stroke:#bc6d00,color:#24292f
+    style G fill:#ffebe9,stroke:#cf222e,color:#24292f
+    style H fill:#fbefff,stroke:#bf3989,color:#24292f
+    style I fill:#ddf4ff,stroke:#0969da,color:#24292f
+    style J fill:#ddf4ff,stroke:#218bff,color:#24292f
+    style K fill:#eaeef2,stroke:#57606a,color:#24292f
+    style L fill:#fff8c5,stroke:#d4a72c,color:#24292f
+    style M fill:#dafbe1,stroke:#1a7f37,color:#24292f
+    style O fill:#eaeef2,stroke:#57606a,color:#24292f
+    style P fill:#dafbe1,stroke:#1a7f37,color:#24292f
+    style Q fill:#ddf4ff,stroke:#0969da,color:#24292f
+    style R fill:#eaeef2,stroke:#8250df,color:#24292f
+    style S fill:#fff8c5,stroke:#bf8700,color:#24292f
+    style T fill:#ddf4ff,stroke:#0969da,color:#24292f
+
+    %% Central links
+    linkStyle default stroke:#8b949e,stroke-width:2px
 ```
 
 > **Tip:** Each branch shows the **category name and its term count**.
