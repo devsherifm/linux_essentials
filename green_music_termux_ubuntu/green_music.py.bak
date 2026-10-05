@@ -1,0 +1,1778 @@
+#!/usr/bin/env python3
+"""
+GREEN MUSIC v7.1
+Textual + Rich terminal music player for Termux, Termux-Proot Ubuntu and Ubuntu 24.04.
+
+UI is intentionally based on the supplied musc-ui.py design: top bar, wide navigation
+palette, Now Playing card, animated sine waveform, searchable playlist, Quick Actions,
+Info card and minimal volume toast.
+
+Playback/features retained from the previous Green Music player:
+- local music discovery under ~/Music (recursive)
+- direct/radio URLs
+- YouTube URL -> stream with yt-dlp
+- YouTube video/playlist -> MP3 download
+- custom.txt batch download via C
+- mpv JSON IPC backend
+- progress click seeking
+- touch/click buttons and playlist rows
+- SPACE, Y, D, C, N, P, S, R, M, L, H, A, Q and arrow keys
+- mobile keyboard-aware layout
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click, Resize
+from textual.reactive import reactive
+from textual.widgets import Button, DataTable, Input, Label, Static
+
+APP = "GREEN MUSIC"
+CONFIG_DIR = Path.home() / ".config" / "green-music"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CUSTOM_FILE = Path.home() / "Music" / "custom.txt"
+SOCKET_FILE = Path(tempfile.gettempdir()) / f"green-music-{os.getuid()}.sock"
+YTDLP = "yt-dlp"
+FFMPEG = "ffmpeg"
+
+AUDIO_EXTS = {
+    ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav",
+    ".webm", ".mka", ".ape", ".wv", ".mp4", ".3gp"
+}
+
+TRACKS_FALLBACK = [
+    ("Main Agar Kahoon", "Om Shanti Om", "05:28"),
+    ("Aankhon Mein Teri Ajab Si", "Om Shanti Om", "04:20"),
+    ("dagabaazre", "-", "--:--"),
+    ("Lyrical: Bol Na Halke Halke", "With lyrics", "04:10"),
+    ("Anuv Jain X Lost Stories - Arz Kiya Hai", "Various", "04:32"),
+    ("Atif Aslam: Pehli Dafa", "Latest Hindi Song 2017", "04:48"),
+    ("Bairan - Animated Love Story", "Various", "05:12"),
+    ("Dil To Pagal Hai", "Shahrukh Khan, Madhuri", "05:09"),
+    ("Do Dil Mil Rahe Hain", "Kumar Sanu", "04:55"),
+    ("Halka Halka Full Video", "Aishwarya Rai", "05:20"),
+    ("Haule Haule - Full Song", "Rab Ne Bana Di Jodi", "04:46"),
+    ("Jaadu Teri Nazar Song", "Darr", "05:14"),
+    ("KAUN TUJHE (Lyrical)", "M.S. DHONI", "05:30"),
+    ("Khuda Jaane - Full Song", "Bachna Ae Haseeno", "05:21"),
+    ("Makhna - Drive", "Sushant Singh Rajput", "04:21"),
+    ("Mitwa", "Shahrukh Khan", "05:01"),
+    ("Na Tum Jano Na Hum", "Kaho Naa Pyaar Hai", "05:18"),
+    ("Nazm Nazm", "Bareilly Ki Barfi", "04:46"),
+    ("Neele Neele Ambar Par", "Male Version", "05:12"),
+    ("Parch Parada", "Dooron Dooron", "04:59"),
+    ("Pehla Nasha", "-", "--:--"),
+]
+
+DEFAULT_CONFIG = {
+    "music_dir": str(Path.home() / "Music"),
+    "music_dirs": [str(Path.home() / "Music"), str(Path.home() / "Downloads"), str(Path.home() / "storage" / "music")],
+    "youtube_dir": str(Path.home() / "Music" / "YouTube"),
+    "volume": 80,
+    "shuffle": False,
+    "repeat": "all",
+    "autoplay": False,
+    "radio": [
+        {"name": "Lofi", "url": "https://ice1.somafm.com/beatblender-128-mp3"},
+        {"name": "Groove Salad", "url": "https://ice1.somafm.com/groovesalad-128-mp3"},
+        {"name": "Chillhop", "url": "https://lfhh.radioca.st/stream"},
+    ],
+}
+
+
+def load_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+        return dict(DEFAULT_CONFIG)
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(data)
+        return cfg
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def command_exists(name):
+    return any((Path(p) / name).is_file() and os.access(Path(p) / name, os.X_OK)
+               for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+
+
+def discover_tracks(music_dir):
+    root = Path(os.path.expanduser(str(music_dir)))
+    if not root.exists():
+        return []
+    found = []
+    try:
+        for f in root.rglob("*"):
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
+                found.append(f)
+    except OSError:
+        pass
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def is_url(s):
+    return bool(re.match(r"^https?://", str(s).strip(), re.I))
+
+
+def is_youtube_url(s):
+    s = str(s).lower()
+    return any(x in s for x in ("youtube.com/", "youtu.be/", "youtube-nocookie.com/"))
+
+
+def is_youtube_playlist_url(s):
+    if not is_youtube_url(s):
+        return False
+    try:
+        return bool(parse_qs(urlparse(str(s).strip()).query).get("list"))
+    except Exception:
+        return False
+
+
+class MPV:
+    def __init__(self):
+        self.proc = None
+        self.sock = None
+        self.request_id = 0
+
+    def start(self):
+        try:
+            SOCKET_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            self.proc = subprocess.Popen(
+                ["mpv", "--no-video", "--idle=yes", "--really-quiet", "--terminal=no",
+                 f"--input-ipc-server={SOCKET_FILE}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if SOCKET_FILE.exists():
+                try:
+                    self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.sock.settimeout(0.08)
+                    self.sock.connect(str(SOCKET_FILE))
+                    return True
+                except OSError:
+                    try: self.sock.close()
+                    except Exception: pass
+                    self.sock = None
+            time.sleep(0.05)
+        return False
+
+    def command(self, *args, timeout=0.18):
+        if not self.sock:
+            return None
+        self.request_id += 1
+        rid = self.request_id
+        try:
+            self.sock.sendall((json.dumps({"command": list(args), "request_id": rid}) + "\n").encode())
+            end = time.time() + timeout
+            data = b""
+            while time.time() < end:
+                try:
+                    chunk = self.sock.recv(16384)
+                    if chunk:
+                        data += chunk
+                        # mpv may send asynchronous event lines before the response.
+                        # Keep reading until the response carrying our request_id arrives.
+                        for line in data.splitlines():
+                            try:
+                                obj = json.loads(line)
+                                if obj.get("request_id") == rid:
+                                    return obj
+                            except Exception:
+                                continue
+                    else:
+                        break
+                except socket.timeout:
+                    break
+            for line in data.splitlines():
+                try:
+                    obj = json.loads(line)
+                    if obj.get("request_id") == rid:
+                        return obj
+                except Exception:
+                    continue
+        except OSError:
+            pass
+        return None
+
+    def get(self, prop, default=None):
+        r = self.command("get_property", prop)
+        return r.get("data", default) if r and r.get("error") == "success" else default
+
+    def set(self, prop, value):
+        return self.command("set_property", prop, value)
+
+    def load(self, target):
+        return self.command("loadfile", target, "replace", timeout=1.0)
+
+    def pause(self): return self.command("cycle", "pause")
+    def seek_relative(self, sec): return self.command("seek", sec, "relative")
+    def seek_absolute(self, sec): return self.command("seek", sec, "absolute")
+
+    def quit(self):
+        try: self.command("quit", timeout=0.2)
+        except Exception: pass
+        try:
+            if self.sock: self.sock.close()
+        except Exception: pass
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                self.proc.wait(timeout=0.7)
+        except Exception:
+            try: self.proc.kill()
+            except Exception: pass
+        try: SOCKET_FILE.unlink(missing_ok=True)
+        except OSError: pass
+
+
+class Track:
+    def __init__(self, name, target, source="Local", duration=None, is_url=False, artist="-"):
+        self.name = name
+        self.target = str(target)
+        self.source = source
+        self.duration = duration
+        self.is_url = is_url
+        self.artist = artist
+
+
+class GreenMusic(App):
+    TITLE = APP
+    CSS = r"""
+    Screen { background: #020b14; color: #d8e8ff; }
+    #root { height: 100%; width: 100%; }
+
+    /* Top bar deliberately follows the supplied Textual reference. */
+    #topbar { height: 6; margin: 1 1 0 1; border: round #008cff; background: #03101c; }
+    #brand { width: 48%; padding: 1 2; }
+    #brand_title { color: #20ff9a; text-style: bold; }
+    #brand_sub { color: #91aee0; }
+    #top_right { width: 52%; content-align: right middle; padding: 1 2; color: #8caee0; }
+
+    #main { height: 1fr; min-height: 18; margin: 1 1 0 1; }
+    #sidebar { width: 22%; min-width: 19; border: round #0078c9; background: #03101a; padding: 1; scrollbar-size: 1 1; }
+    .nav_button { width: 100%; height: 2; margin: 0; border: none; background: transparent; color: #d8e7ff; content-align: left middle; }
+    .nav_button:hover { background: #06273a; color: #22ff9a; }
+    .nav_button:focus { background: #063b39; color: #20ff9a; text-style: bold; }
+    .nav_button.nav_active { background: #063d35; color: #20ff9a; text-style: bold; }
+
+    #content { width: 78%; padding-left: 1; min-height: 18; }
+    #nowplaying { height: 20; min-height: 15; border: round #008cff; background: #03101a; padding: 1 2; overflow: hidden; }
+    .section_title { color: #20ff9a; text-style: bold; }
+    #np_header { height: 2; }
+    #track_area { height: 7; min-height: 5; }
+    #album { width: 21%; height: 7; min-height: 5; border: round #008cff; background: #032039; color: #159cff; content-align: center middle; text-style: bold; }
+    #track_info { width: 79%; padding-left: 2; }
+    #track_title { color: #e5efff; text-style: bold; }
+    #artist { color: #9bb4d9; }
+    #album_name { color: #b4c9ea; }
+    #source_line { color: #159cff; }
+    #progress { height: 2; color: #20ff9a; content-align: center middle; }
+    #wave { height: 4; min-height: 2; color: #20ff9a; content-align: center middle; }
+    #progress { height: 2; min-height: 2; color: #20ff9a; content-align: center middle; }
+    #controls { height: 4; min-height: 3; align: center middle; }
+    .control_button { width: 10; height: 4; margin: 0 1; border: none; background: transparent; color: #d9e9ff; }
+    .control_button:hover { background: #073242; color: #20ff9a; }
+    .control_button:focus { background: #073242; color: #20ff9a; }
+    .control_button.active { background: #0a4a35; color: #20ff9a; border: round #20ff9a; }
+    #play_button { width: 12; height: 4; border: round #20ff9a; background: #20e89a; color: #00150c; text-style: bold; }
+    #play_button:hover { background: #55ffb5; }
+    #volume_button { width: 15; height: 3; border: round #176da5; background: #02111d; color: #20ff9a; }
+    #lyrics_button { width: 12; height: 3; border: round #176da5; background: #02111d; color: #20ff9a; }
+
+    #playlist_panel { height: 1fr; min-height: 8; margin-top: 1; border: round #008cff; background: #03101a; padding: 1; overflow: hidden; }
+    #playlist_header { height: 3; min-height: 3; }
+    #job_status { height: 2; min-height: 2; margin: 0 0 1 0; padding: 0 1; color: #20ff9a; background: #061d19; border: round #20ff9a; display: none; content-align: left middle; }
+    #job_status.show { display: block; }
+    #choice_input { height: 3; min-height: 3; margin: 0 0 1 0; border: round #20ff9a; background: #02111d; color: #d9e9ff; display: none; }
+    #choice_input.show { display: block; }
+    #playlist_title { width: 52%; color: #159cff; text-style: bold; }
+    #search { width: 48%; height: 3; border: round #176da5; background: #02111d; color: #d9e9ff; }
+    DataTable { height: 1fr; min-height: 4; border: none; background: #020c15; color: #d7e7ff; overflow-y: auto; overflow-x: auto; }
+    DataTable > .datatable--header { background: #064b55; color: #dffcff; text-style: bold; }
+    DataTable > .datatable--cursor { background: #0bbf68; color: #00180e; text-style: bold; }
+    DataTable > .datatable--even-row { background: #03101a; }
+    DataTable > .datatable--odd-row { background: #020c15; }
+
+    #bottom { height: 12; min-height: 12; margin: 1 1 0 1; }
+    #quick { width: 58%; border: round #008cff; background: #03101a; padding: 1; }
+    #info { width: 42%; margin-left: 1; border: round #008cff; background: #03101a; padding: 1; }
+    #quick_title, #info_title { color: #20ff9a; text-style: bold; }
+    .quick_row { height: 4; }
+    .quick_row.secondary { height: 4; }
+    .quick_row.secondary .quick_button { width: 33%; }
+    .quick_button { width: 50%; margin: 0 1; border: round #145579; background: #041522; color: #b8d0ed; }
+    .quick_button:hover { border: round #20ff9a; color: #20ff9a; background: #06322d; }
+    .quick_button:focus { border: round #20ff9a; color: #20ff9a; background: #063d35; text-style: bold; }
+    .quick_button.active { background: #0a4a35; color: #20ff9a; border: round #20ff9a; }
+    #info_text { color: #b8cceb; }
+    #footer { height: 2; margin: 0 2; color: #4780b5; content-align: center middle; }
+
+    /* Native Textual notification rack: safe across terminal sizes. */
+    ToastRack { align: right bottom; width: auto; height: auto; padding: 0 1; }
+    Toast { background: #061d19; color: #20ff9a; border: round #20ff9a; padding: 0 1; min-width: 24; }
+    Toast.-information { border-left: thick #20ff9a; }
+    Toast.-warning { border-left: thick #f2c94c; }
+    Toast.-error { border-left: thick #ff5c5c; }
+
+    #overlay { layer: overlay; width: 100%; height: 100%; align: center middle; background: #020b14 90%; display: none; }
+    #overlay.show { display: block; }
+    #overlay_box { width: 80%; max-width: 90; height: auto; border: round #20ff9a; background: #03101a; padding: 2; }
+    #overlay_title { color: #20ff9a; text-style: bold; }
+    #overlay_input { margin-top: 1; }
+
+    """
+
+    BINDINGS = [
+        Binding("space", "toggle_play", "Play/Pause", priority=True),
+        Binding("right", "seek_forward", "Seek +10", priority=True),
+        Binding("left", "seek_back", "Seek -10", priority=True),
+        Binding("up", "volume_up", "Volume +", priority=True),
+        Binding("down", "volume_down", "Volume -", priority=True),
+        Binding("n", "next_track", "Next"),
+        Binding("p", "previous_track", "Previous"),
+        Binding("b", "previous_track", "Previous"),
+        Binding("s", "search_online", "Search"),
+        Binding("f", "shuffle", "Shuffle"),
+        Binding("r", "repeat", "Repeat"),
+        Binding("m", "mute", "Mute"),
+        Binding("y", "youtube", "YouTube"),
+        Binding("d", "download", "Download"),
+        Binding("c", "custom", "Custom"),
+        Binding("l", "reload", "Reload"),
+        Binding("h", "help", "Help"),
+        Binding("a", "add", "Online"),
+        Binding("q", "quit_app", "Quit"),
+    ]
+
+    playing = reactive(False)
+    volume_value = reactive(80)
+    current_index = reactive(0)
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_config()
+        # v6.4 is manual-playback only. Migrate older configs that enabled autoplay.
+        if self.cfg.get("autoplay", False):
+            self.cfg["autoplay"] = False
+            save_config(self.cfg)
+        self.mpv = MPV()
+        self.tracks: list[Track] = []
+        self.filtered_indices: list[int] = []
+        self.pending_youtube_url = None
+        self.status = "READY"
+        self.message = ""
+        self.repeat_mode = self.cfg.get("repeat", "all")
+        self.shuffle_enabled = bool(self.cfg.get("shuffle", False))
+        self.toast_timer = None
+        self.wave_phase = 0.0
+        self.base_height = None
+        self.keyboard_open = False
+        self.overlay_mode = None
+        self.playlist_entries = []
+        self.playlist_source_url = None
+        self.playlist_count = None
+        self.playlist_selection = None
+        self._syncing_table = False
+        self._last_eof = False
+        self._last_play_request = 0.0
+        self.player_pos = 0.0
+        self.player_duration = 0.0
+        self.player_pause = True
+        self.player_eof = False
+        self.player_path = None
+        self._job_active = False
+        self._job_total = 0
+        self._job_done = 0
+        self.view_mode = "library"
+        self.online_results = []
+        self.search_query = ""
+        self.choice_mode = None
+        self.choice_items = []
+        self.choice_input_active = False
+        self.rebuild_playlist()
+        self.volume_value = int(self.cfg.get("volume", 80))
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="root"):
+            with Horizontal(id="topbar"):
+                with Vertical(id="brand"):
+                    yield Static("♫  G R E E N   M U S I C", id="brand_title")
+                    yield Static("    Lofi   ·   Local   ·   Radio   ·   URL   ·   YouTube", id="brand_sub")
+                yield Static("Minimal music player for Terminal\nSat, 19 Sep 2026  |  05:09   ⚙", id="top_right")
+
+            with Horizontal(id="main"):
+                with VerticalScroll(id="sidebar"):
+                    yield Button("▶   Now Playing", id="nav-now", classes="nav_button nav_active")
+                    yield Button("♫   Playlist", id="nav-playlist", classes="nav_button")
+                    yield Button("⌕   Search", id="nav-search", classes="nav_button")
+                    yield Button("□   Browse", id="nav-browse", classes="nav_button")
+                    yield Button("▶   YouTube", id="nav-youtube", classes="nav_button")
+                    yield Button("♟   Radio", id="nav-radio", classes="nav_button")
+                    yield Button("▣   Library", id="nav-library", classes="nav_button")
+                    yield Button("⚙   Settings", id="nav-settings", classes="nav_button")
+                    yield Button("?   Help", id="nav-help", classes="nav_button")
+                    yield Button("⏻   Quit", id="nav-quit", classes="nav_button")
+
+                with Vertical(id="content"):
+                    with Vertical(id="nowplaying"):
+                        with Horizontal(id="np_header"):
+                            yield Static("NOW PLAYING", classes="section_title")
+                            yield Static("♫  LYRICS", classes="section_title", id="lyrics_label")
+                            yield Button(f"🔊 VOL {self.volume_value}%", id="volume_button")
+                        with Horizontal(id="track_area"):
+                            yield Static("♫\n\n♪", id="album")
+                            with Vertical(id="track_info"):
+                                yield Static("No track selected", id="track_title")
+                                yield Static("-", id="artist")
+                                yield Static("", id="album_name")
+                                yield Static("FILE", id="source_line")
+                        yield Static("", id="wave")
+                        yield Static("00:00  ━━━━━━━━━━━━━●━━━━━━━━━━━━  --:--", id="progress")
+                        with Horizontal(id="controls"):
+                            yield Button("🔀 OFF", id="shuffle", classes="control_button")
+                            yield Button("⏮", id="previous", classes="control_button")
+                            yield Button("⏸", id="play_button", classes="control_button")
+                            yield Button("⏭", id="next", classes="control_button")
+                            yield Button("🔁 ALL", id="repeat", classes="control_button")
+
+                    with Vertical(id="playlist_panel"):
+                        with Horizontal(id="playlist_header"):
+                            yield Static("PLAYLIST   (0 tracks)", id="playlist_title")
+                            yield Input(placeholder="⌕  Search in playlist...", id="search")
+                        yield Static("", id="job_status")
+                        yield Input(placeholder="Choose a number and press Enter", id="choice_input")
+                        table = DataTable(id="playlist_table", cursor_type="row", zebra_stripes=True)
+                        table.add_columns("#", "Title", "Artist", "Dur")
+                        yield table
+
+            with Horizontal(id="bottom"):
+                with Vertical(id="quick"):
+                    yield Static("QUICK ACTIONS", id="quick_title")
+                    with Horizontal(classes="quick_row"):
+                        yield Button("▶  Play / Pause    [ SPACE ]", id="quick-play", classes="quick_button")
+                        yield Button("🔀  Shuffle [OFF]    [ F ]", id="quick-shuffle", classes="quick_button")
+                    with Horizontal(classes="quick_row secondary"):
+                        yield Button("⏮  Previous [ P ]", id="quick-prev", classes="quick_button")
+                        yield Button("⏭  Next [ N ]", id="quick-next", classes="quick_button")
+                        yield Button("🔁  Repeat [ ALL ] [ R ]", id="quick-repeat", classes="quick_button")
+                with Vertical(id="info"):
+                    yield Static("INFO", id="info_title")
+                    yield Static("", id="info_text")
+
+            yield Static("♪   Music for a better terminal experience                              v7.1.0", id="footer")
+            with Vertical(id="overlay"):
+                with Vertical(id="overlay_box"):
+                    yield Static("", id="overlay_title")
+                    yield Input(id="overlay_input", placeholder="Paste URL or type a search query and press Enter")
+                    yield Static("ESC to cancel", id="overlay_hint")
+
+    def on_mount(self):
+        self.base_height = self.size.height
+        self.update_all()
+        self.set_interval(0.10, self.tick)
+        self.set_interval(1.0, self.update_clock)
+        self.set_interval(0.20, self.poll_player)
+        try:
+            if not self.mpv.start():
+                self.status = "ERROR"
+                self.message = "mpv not found or IPC could not start. Install mpv."
+            else:
+                self.mpv.set("volume", self.volume_value)
+                self.playing = False
+                self.status = "READY"
+                self.message = "Select a track to play"
+        except Exception as e:
+            self.status = "ERROR"
+            self.message = f"mpv error: {e}"
+        self.update_all()
+
+    def on_unmount(self):
+        self.mpv.quit()
+
+    def on_resize(self, event: Resize):
+        h = event.size.height
+        if self.base_height is None or h > self.base_height:
+            self.base_height = h
+
+        # On short Ubuntu/VirtualBox terminals and when the Android keyboard is
+        # open, preserve the Now Playing controls and the library/search table.
+        # Quick Actions is the first area we hide because it is redundant with
+        # keyboard bindings and the player controls.
+        compact = bool(self.base_height and (h <= 56 or self.base_height - h >= 8))
+        self.keyboard_open = compact
+
+        try:
+            self.query_one("#bottom").display = not compact
+            self.query_one("#footer").display = True
+            self.query_one("#album").display = not compact
+            if compact:
+                self.query_one("#track_area").styles.height = 5
+                self.query_one("#wave").styles.height = 4
+                self.query_one("#nowplaying").styles.height = 17
+                self.query_one("#playlist_panel").styles.min_height = 12
+            else:
+                self.query_one("#track_area").styles.height = 7
+                self.query_one("#wave").styles.height = 4
+                self.query_one("#nowplaying").styles.height = 20
+                self.query_one("#playlist_panel").styles.min_height = 10
+            self.update_control_state()
+            self.refresh(layout=True)
+        except Exception:
+            # Textual can dispatch an early resize while the widget tree is
+            # still mounting. Do not let that transient state terminate the app.
+            return
+
+    # ---------- data ----------
+    def rebuild_playlist(self):
+        dirs = self.cfg.get("music_dirs") or [self.cfg.get("music_dir", "~/Music")]
+        found = []
+        seen = set()
+        for directory in dirs:
+            for p in discover_tracks(directory):
+                key = str(p.resolve()) if p.exists() else str(p)
+                if key not in seen:
+                    seen.add(key)
+                    found.append(p)
+        tracks = [Track(p.stem, p, "FILE", artist=p.parent.name or "Local") for p in sorted(found, key=lambda p: str(p).lower())]
+        # Add configured radio entries after local files. No fake local tracks are inserted
+        # when real files exist; this keeps the library genuinely directory-driven.
+        for r in self.cfg.get("radio", []):
+            tracks.append(Track(r.get("name", "Radio"), r.get("url", ""), "RADIO", is_url=True))
+        if not tracks:
+            tracks = [Track(t, "", a, None, False, a) for t, a, _ in TRACKS_FALLBACK]
+        self.tracks = tracks
+        self.write_library_index()
+        self.filtered_indices = list(range(len(tracks)))
+        self.current_index = min(self.current_index, max(0, len(tracks) - 1))
+
+    def write_library_index(self):
+        """Keep a small local JSON index for fast, predictable search."""
+        try:
+            index_path = CONFIG_DIR / "library.json"
+            payload = [{
+                "index": i, "title": t.name, "artist": t.artist or "",
+                "source": t.source, "path": t.target
+            } for i, t in enumerate(self.tracks)]
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def current(self):
+        return self.tracks[self.current_index] if self.tracks and 0 <= self.current_index < len(self.tracks) else None
+
+    def update_all(self):
+        if not self.is_mounted:
+            return
+        self.update_track_widgets()
+        self.update_playlist()
+        self.update_info()
+        self.update_control_state()
+        self.update_clock()
+
+    def update_track_widgets(self):
+        t = self.current()
+        if not t:
+            return
+        self.query_one("#track_title", Static).update(t.name)
+        self.query_one("#artist", Static).update(t.artist or t.source)
+        self.query_one("#album_name", Static).update("Shahrukh Khan, Deepika Padukone" if "Main Agar" in t.name else t.source)
+        self.query_one("#source_line", Static).update(t.source)
+        self.query_one("#volume_button", Button).label = f"🔊 VOL {self.volume_value}%"
+
+    def update_playlist(self):
+        table = self.query_one("#playlist_table", DataTable)
+        self._syncing_table = True
+        table.clear(columns=False)
+        if self.view_mode in {"online_search", "playlist_preview"}:
+            items = self.online_results
+            for n, item in enumerate(items, 1):
+                title = (item.get("title") or "Video").strip()
+                channel = (item.get("channel") or item.get("uploader") or "YouTube").strip()
+                duration = item.get("duration_string") or self.format_time(item.get("duration"))
+                table.add_row(f"{n:02d}", title, channel, duration, key=f"online:{n-1}")
+            label = "SEARCH RESULTS" if self.view_mode == "online_search" else "PLAYLIST VIDEOS"
+            self.query_one("#playlist_title", Static).update(f"{label}   ({len(items)} videos)")
+        else:
+            self.filtered_indices = list(self.filtered_indices or range(len(self.tracks)))
+            for idx in self.filtered_indices:
+                t = self.tracks[idx]
+                duration = self.format_time(t.duration)
+                table.add_row(f"{idx + 1:02d}", t.name, t.artist or t.source, duration, key=str(idx))
+            if self.filtered_indices:
+                try:
+                    table.move_cursor(row=self.filtered_indices.index(self.current_index), column=0, animate=False)
+                except Exception:
+                    pass
+            self.query_one("#playlist_title", Static).update(f"PLAYLIST   ({len(self.tracks)} tracks)")
+        self._syncing_table = False
+        try:
+            table.scroll_home(animate=False)
+        except Exception:
+            pass
+
+    def update_info(self):
+        t = self.current()
+        if not t:
+            return
+        pos = self.safe_float(self.player_pos, 0)
+        dur = self.player_duration if self.player_duration > 0 else t.duration
+        info = (
+            f"♫   {t.name}\n\n"
+            f"     {t.artist or '-'}\n"
+            f"     Source: {t.source}\n\n"
+            f"Format  : {Path(t.target).suffix.lstrip('.') or 'stream'}\n"
+            f"Volume  : {self.volume_value}%\n"
+            f"Shuffle : {'ON' if self.shuffle_enabled else 'OFF'}\n"
+            f"Repeat  : {self.repeat_mode.upper()}\n"
+            f"Next    : {self.next_name()}\n\n"
+            f"Playing : {self.format_time(pos)} / {self.format_time(dur)}"
+        )
+        self.query_one("#info_text", Static).update(info)
+
+    def update_control_state(self):
+        # Keep visual state explicitly synchronized with the actual player state.
+        # This is intentionally called often so Android/Termux resume, focus, or
+        # terminal redraws cannot leave a stale ON/OFF highlight behind.
+        paused = not self.playing
+        shuffle_on = bool(self.shuffle_enabled)
+        repeat_on = self.repeat_mode != "off"
+        self.query_one("#play_button", Button).label = "▶" if paused else "⏸"
+        self.query_one("#quick-play", Button).label = f"{'▶' if paused else '⏸'}  Play / Pause    [ SPACE ]"
+
+        shuffle = self.query_one("#shuffle", Button)
+        quick_shuffle = self.query_one("#quick-shuffle", Button)
+        for button in (shuffle, quick_shuffle):
+            if shuffle_on:
+                button.add_class("active")
+            else:
+                button.remove_class("active")
+        shuffle.label = "🔀 ON" if shuffle_on else "🔀 OFF"
+        quick_shuffle.label = "🔀  Shuffle [ON]     [ F ]" if shuffle_on else "🔀  Shuffle [OFF]    [ F ]"
+
+        repeat = self.query_one("#repeat", Button)
+        quick_repeat = None
+        try:
+            quick_repeat = self.query_one("#quick-repeat", Button)
+        except Exception:
+            pass
+        for button in (repeat, quick_repeat):
+            if button is None:
+                continue
+            if repeat_on:
+                button.add_class("active")
+            else:
+                button.remove_class("active")
+        repeat.label = f"🔁 {self.repeat_mode.upper()}"
+        if quick_repeat is not None:
+            quick_repeat.label = f"🔁  Repeat [{self.repeat_mode.upper()}]     [ R ]"
+
+    def update_clock(self):
+        if not self.is_mounted:
+            return
+        now = datetime.now().strftime("%a, %d %b %Y  |  %H:%M")
+        self.query_one("#top_right", Static).update(f"Minimal music player for Terminal\n{now}   ⚙")
+
+    # ---------- player ----------
+    def start_track(self, track):
+        if not track or not track.target:
+            self.status = "READY"; self.message = "No playable file/URL in this item"; self.playing = False; return False
+        target = track.target
+        if track.source == "FILE":
+            path = Path(os.path.expanduser(target))
+            if not path.is_file():
+                self.status = "ERROR"; self.message = f"File not found: {path}"; self.playing = False; self.show_toast("File not found"); return False
+        if track.is_url and is_youtube_url(target):
+            self.status = "RESOLVING"; self.message = "Resolving YouTube stream..."; self.update_info()
+            stream = self.resolve_youtube_stream(target)
+            if not stream:
+                self.status = "ERROR"; self.playing = False; return False
+            target = stream
+        result = self.mpv.load(target)
+        if result is not None and result.get("error") not in (None, "success"):
+            self.status = "ERROR"; self.message = f"mpv: {result.get('error')}"; self.playing = False; self.show_toast("Audio load failed"); return False
+        self.mpv.set("pause", False)
+        self.mpv.set("volume", self.volume_value)
+        self.playing = True; self.status = "PLAYING"; self.message = track.name
+        self.player_pos = 0.0
+        self.player_duration = 0.0
+        self.player_pause = False
+        self.player_eof = False
+        self.player_path = target
+        self._last_eof = False; self._last_play_request = time.monotonic()
+        return True
+
+    def play_index(self, idx):
+        if not self.tracks:
+            return
+        self.current_index = max(0, min(idx, len(self.tracks) - 1))
+        self.start_track(self.current())
+        self.update_all()
+
+    def toggle_play(self):
+        if not self.current(): return
+        if not self.player_path:
+            self.play_index(self.current_index)
+            return
+        self.mpv.pause()
+        # mpv may answer asynchronously; use the local state immediately and
+        # let poll_player reconcile it on the next 200 ms tick.
+        self.player_pause = not self.player_pause
+        self.playing = not self.player_pause
+        self.status = "PLAYING" if self.playing else "PAUSED"
+        self.update_control_state()
+
+    def next_track(self):
+        if not self.tracks: return
+        if self.shuffle_enabled and len(self.tracks) > 1:
+            choices = [i for i in range(len(self.tracks)) if i != self.current_index]
+            idx = random.choice(choices)
+        else:
+            idx = (self.current_index + 1) % len(self.tracks)
+        self.play_index(idx)
+
+    def previous_track(self):
+        if not self.current(): return
+        pos = self.safe_float(self.player_pos, 0)
+        if pos > 5:
+            self.mpv.seek_absolute(0)
+            self.show_toast("Track restarted")
+            return
+        self.play_index((self.current_index - 1) % len(self.tracks))
+
+    def seek(self, seconds):
+        self.mpv.seek_relative(seconds)
+        self.show_toast(f"Seek {'+' if seconds >= 0 else ''}{seconds}s")
+
+    def seek_absolute(self, ratio):
+        dur = self.safe_float(self.player_duration, 0)
+        if dur <= 0:
+            self.show_toast("Seek unavailable")
+            return
+        target = max(0, min(dur, dur * ratio))
+        self.mpv.seek_absolute(target)
+        self.show_toast(f"Seek {self.format_time(target)}")
+
+    def change_volume(self, amount):
+        self.volume_value = max(0, min(100, int(self.volume_value + amount)))
+        self.cfg["volume"] = self.volume_value
+        save_config(self.cfg)
+        self.mpv.set("volume", self.volume_value)
+        self.show_toast(f"🔊 Volume  {self.volume_value}%")
+        self.update_all()
+
+    def mute(self):
+        self.mpv.command("cycle", "mute")
+        muted = bool(self.mpv.get("mute", False))
+        self.show_toast("🔇 Muted" if muted else "🔊 Unmuted")
+
+    def toggle_shuffle(self):
+        self.shuffle_enabled = not self.shuffle_enabled
+        self.cfg["shuffle"] = self.shuffle_enabled
+        save_config(self.cfg)
+        self.show_toast("Shuffle ON" if self.shuffle_enabled else "Shuffle OFF")
+        self.update_control_state()
+
+    def toggle_repeat(self):
+        self.repeat_mode = {"all": "one", "one": "off", "off": "all"}.get(self.repeat_mode, "all")
+        self.cfg["repeat"] = self.repeat_mode
+        save_config(self.cfg)
+        self.show_toast(f"Repeat {self.repeat_mode.upper()}")
+        self.update_control_state()
+
+    # ---------- animation ----------
+    def tick(self):
+        if not self.is_mounted: return
+        self.wave_phase += 0.12
+        self.draw_wave()
+        self.draw_progress()
+        self.update_info()
+        self.update_control_state()
+
+    def draw_wave(self):
+        widget = self.query_one("#wave")
+        width = max(30, min(180, widget.region.width - 2))
+        height = 5
+        phase = self.wave_phase
+        center = (height - 1) / 2.0
+        amp = max(1.0, center - 0.15)
+        points = []
+        # Two smooth sine cycles across the available terminal width.
+        for x in range(width):
+            y = center - amp * math.sin(phase + (x / max(1, width - 1)) * math.tau * 2.0)
+            points.append(int(round(max(0, min(height - 1, y)))))
+
+        rows = [[" " for _ in range(width)] for _ in range(height)]
+        for x, y in enumerate(points):
+            if x == 0:
+                rows[y][x] = "●"
+                continue
+            py = points[x - 1]
+            if y < py:
+                ch = "╱"
+            elif y > py:
+                ch = "╲"
+            else:
+                ch = "━"
+            rows[y][x] = ch
+            if py != y:
+                rows[py][x - 1] = "╱" if y < py else "╲"
+        widget.update("\n".join("".join(row) for row in rows))
+
+    def draw_progress(self):
+        if not self.current():
+            return
+        pos = self.safe_float(self.player_pos, 0)
+        dur = self.safe_float(self.player_duration, 0)
+        if dur <= 0:
+            dur = self.parse_time(self.current().duration)
+        widget = self.query_one("#progress")
+        width = max(24, widget.region.width - 20)
+        ratio = max(0.0, min(1.0, pos / dur)) if dur > 0 else 0.0
+        filled = int(ratio * width)
+        bar = "━" * filled + "●" + "━" * max(0, width - filled - 1)
+        if dur <= 0:
+            bar = "━" * (width // 2) + "○" + "━" * max(0, width - width // 2 - 1)
+        widget.update(f"{self.format_time(pos)}  {bar}  {self.format_time(dur)}")
+
+    # ---------- yt-dlp/download ----------
+    def start_background(self, func, *args):
+        """Run blocking yt-dlp work in a daemon thread, independent of Textual Worker API."""
+        def runner():
+            try:
+                func(*args)
+            except Exception as exc:
+                if self.is_mounted:
+                    self.call_from_thread(self.set_error, f"Background job failed: {str(exc)[:100]}")
+        threading.Thread(target=runner, name="green-music-job", daemon=True).start()
+
+    def set_job(self, text, total=None, done=None, show=True):
+        self._job_active = show
+        if total is not None: self._job_total = int(total)
+        if done is not None: self._job_done = int(done)
+        if not self.is_mounted: return
+        widget = self.query_one("#job_status", Static)
+        if not show:
+            widget.update("")
+            widget.remove_class("show")
+            return
+
+        label = str(text)
+        # Add a compact visual progress meter when a total is known.
+        pct_match = re.search(r"(\d+(?:\.\d+)?)%", label)
+        pct = None
+        if pct_match:
+            pct = max(0, min(100, int(float(pct_match.group(1)))))
+        elif self._job_total > 0:
+            pct = max(0, min(100, int((self._job_done / self._job_total) * 100)))
+        if pct is not None:
+            width = 20
+            filled = int(width * pct / 100)
+            meter = "━" * filled + "·" * (width - filled)
+            label = f"{label}  [{meter}]"
+        widget.update(label)
+        widget.add_class("show")
+
+    def yt_ready(self):
+        if not command_exists(YTDLP):
+            self.status = "ERROR"; self.message = "yt-dlp not installed"
+            self.show_toast("Install yt-dlp first")
+            return False
+        return True
+
+    def resolve_youtube_stream(self, url):
+        if not self.yt_ready(): return None
+        try:
+            p = subprocess.run([YTDLP, "--no-playlist", "-f", "bestaudio/best", "-g", url],
+                               capture_output=True, text=True, timeout=45)
+            urls = [x.strip() for x in p.stdout.splitlines() if x.strip()]
+            if p.returncode != 0 or not urls:
+                err = p.stderr.strip().splitlines()
+                self.message = (err[-1] if err else "Could not resolve YouTube URL")[:140]
+                self.show_toast("YouTube resolve failed")
+                return None
+            return urls[-1]
+        except subprocess.TimeoutExpired:
+            self.message = "YouTube resolve timed out"; self.show_toast(self.message)
+        except Exception as e:
+            self.message = f"YouTube error: {e}"; self.show_toast("YouTube error")
+        return None
+
+    def get_youtube_title(self, url):
+        try:
+            p = subprocess.run([YTDLP, "--no-playlist", "--print", "%(title)s", "--skip-download", url],
+                               capture_output=True, text=True, timeout=30)
+            lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
+            return lines[-1] if lines else "YouTube audio"
+        except Exception:
+            return "YouTube audio"
+
+    def search_online(self):
+        self.open_url_overlay("search")
+
+    def search_youtube_worker(self, query):
+        if not self.yt_ready():
+            return
+        query = " ".join(str(query).split())
+        if not query:
+            return
+        self.call_from_thread(self.set_message, f"Searching YouTube: {query}")
+        self.call_from_thread(self.set_job, f"Searching YouTube • {query}", 0, 0, True)
+        try:
+            search_target = f"ytsearch10:{query}"
+            p = subprocess.run(
+                [YTDLP, "--flat-playlist", "--no-warnings", "--color", "never", "--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration_string)s", search_target],
+                capture_output=True, text=True, timeout=90,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            if p.returncode != 0:
+                err = [x.strip() for x in p.stderr.splitlines() if x.strip()]
+                self.call_from_thread(self.set_error, f"YouTube search failed: {(err[-1] if err else 'unknown error')[:90]}")
+                return
+            results = []
+            for line in p.stdout.splitlines():
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                title = parts[0].strip()
+                url = parts[1].strip()
+                if not title or not url or not is_url(url):
+                    continue
+                results.append({
+                    "title": title,
+                    "webpage_url": url,
+                    "channel": parts[2].strip() if len(parts) > 2 else "YouTube",
+                    "duration_string": parts[3].strip() if len(parts) > 3 else "--:--",
+                })
+            if not results:
+                self.call_from_thread(self.set_error, "No YouTube results found")
+                return
+            self.call_from_thread(self.show_search_results, query, results)
+        except subprocess.TimeoutExpired:
+            self.call_from_thread(self.set_error, "YouTube search timed out")
+        except Exception as exc:
+            self.call_from_thread(self.set_error, f"Search error: {str(exc)[:90]}")
+
+    def show_search_results(self, query, results):
+        self.search_query = query
+        self.online_results = results
+        self.view_mode = "online_search"
+        self.set_job(f"YouTube search • {len(results)} results", 0, 0, True)
+        self.show_choice_input("search", results, f"Select song 1-{len(results)} — type number + Enter")
+        self.update_playlist()
+        self.activate_nav("nav-search")
+
+    def choose_online_result(self, idx, download=True):
+        if not (0 <= idx < len(self.online_results)):
+            self.show_toast("Invalid search result")
+            return
+        item = self.online_results[idx]
+        target = item.get("webpage_url") or item.get("original_url")
+        title = item.get("title") or "YouTube result"
+        if not target:
+            self.show_toast("Search result has no URL")
+            return
+        self.hide_choice_input()
+        if download:
+            self.set_job(f"Downloading selected song • {title[:65]}", 1, 0, True)
+            self.start_background(self.download_and_play_search_result, target, title)
+        else:
+            self.play_youtube(target)
+
+    def download_and_play_search_result(self, url, title):
+        if not self.yt_ready():
+            return
+        if not command_exists(FFMPEG):
+            self.call_from_thread(self.set_error, "ffmpeg is required")
+            return
+        out_dir = Path(os.path.expanduser(self.cfg.get("youtube_dir", "~/Music/YouTube")))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        existing = self.existing_music_titles()
+        key = self._normalized_title(title)
+        if key and key in existing:
+            # Prefer the local copy and start it immediately.
+            self.call_from_thread(self.set_message, f"Already downloaded: {title}")
+            self.call_from_thread(self.play_local_title, title)
+            return
+        self.call_from_thread(self.set_message, f"Downloading: {title}")
+        ok, reason = self._download_one(url, str(out_dir / "%(title)s.%(ext)s"), "Search download")
+        if not ok:
+            self.call_from_thread(self.set_error, "Selected song download failed" if reason != "timeout" else "Download timed out")
+            return
+        self.call_from_thread(self.finish_download_and_play, title)
+
+    def play_local_title(self, title):
+        key = self._normalized_title(title)
+        for i, track in enumerate(self.tracks):
+            if self._normalized_title(track.name) == key and track.source == "FILE":
+                self.view_mode = "library"
+                self.current_index = i
+                self.start_track(track)
+                self.update_all()
+                return
+        self.rebuild_playlist()
+        for i, track in enumerate(self.tracks):
+            if self._normalized_title(track.name) == key and track.source == "FILE":
+                self.current_index = i
+                self.start_track(track)
+                self.update_all()
+                return
+        self.show_toast("Downloaded file found, but could not locate it in library")
+
+    def finish_download_and_play(self, title):
+        self.rebuild_playlist()
+        self.set_job(f"Downloaded • {title[:65]} • starting playback", 1, 1, True)
+        self.play_local_title(title)
+        self.status = "PLAYING"
+        self.message = title
+        self.update_all()
+        self.show_toast("Downloaded and playing")
+
+    def youtube(self): self.open_url_overlay("youtube")
+    def download(self): self.open_url_overlay("download")
+    def add(self): self.open_url_overlay("radio")
+
+    def custom(self):
+        custom_file = Path(os.path.expanduser(str(CUSTOM_FILE)))
+        custom_file.parent.mkdir(parents=True, exist_ok=True)
+        if not custom_file.exists():
+            custom_file.write_text("# One YouTube video URL per line\n", encoding="utf-8")
+            self.show_toast("Created ~/Music/custom.txt")
+            return
+        urls = []
+        for line in custom_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            u = line.strip()
+            if u and not u.startswith("#") and is_youtube_url(u) and not is_youtube_playlist_url(u):
+                if u not in urls: urls.append(u)
+        if not urls:
+            self.show_toast("No YouTube video URLs in custom.txt")
+            return
+        self.start_background(self.download_urls, urls)
+
+    def open_url_overlay(self, mode):
+        self.overlay_mode = mode
+        title = {"youtube": "YOUTUBE / URL", "download": "DOWNLOAD MP3", "radio": "RADIO / DIRECT URL", "search": "SEARCH YOUTUBE MUSIC"}.get(mode, "URL")
+        self.query_one("#overlay_title", Static).update(title)
+        self.query_one("#overlay_input", Input).value = ""
+        self.query_one("#overlay").add_class("show")
+        self.query_one("#overlay_input", Input).focus()
+
+    def close_overlay(self):
+        self.overlay_mode = None
+        self.query_one("#overlay").remove_class("show")
+        self.query_one("#overlay_input", Input).display = True
+
+    def on_input_submitted(self, event: Input.Submitted):
+        if event.input.id == "choice_input":
+            self.handle_choice(event.value.strip())
+            return
+        if event.input.id != "overlay_input": return
+        url = event.value.strip()
+        mode = self.overlay_mode
+        self.close_overlay()
+        if mode == "playlist_count":
+            total = len(self.playlist_entries)
+            text = url.strip()
+            try:
+                if not text:
+                    # Blank = all videos, in playlist order.
+                    self.playlist_count = total
+                    self.playlist_selection = list(range(total))
+                    self.begin_playlist_order_prompt()
+                    return
+                if "," in text:
+                    raw = [x.strip() for x in text.split(",") if x.strip()]
+                    if not raw or any(not x.isdigit() for x in raw):
+                        raise ValueError
+                    nums = [int(x) for x in raw]
+                    if any(n < 1 or n > total for n in nums):
+                        self.show_toast(f"Use video numbers 1-{total}")
+                        self.begin_playlist_prompt(self.playlist_entries)
+                        return
+                    seen = set(); selected = []
+                    for n in nums:
+                        if n not in seen:
+                            seen.add(n); selected.append(n - 1)
+                    self.playlist_selection = selected
+                    self.playlist_count = len(selected)
+                    self.begin_playlist_order_prompt()
+                    return
+                count = int(text)
+                if 1 <= count <= total:
+                    self.playlist_count = count
+                    self.playlist_selection = list(range(count))
+                    self.begin_playlist_order_prompt()
+                else:
+                    self.show_toast(f"Enter 1-{total}, or 1,5,6...")
+                    self.begin_playlist_prompt(self.playlist_entries)
+            except ValueError:
+                self.show_toast(f"Enter 1-{total}, comma-separated numbers, or blank")
+                self.begin_playlist_prompt(self.playlist_entries)
+            return
+        if mode == "playlist_order":
+            text = url.strip().lower()
+            if not text or text in {"a", "asc", "ascending"}:
+                order = "a"
+            elif text in {"d", "desc", "descending"}:
+                order = "d"
+            else:
+                self.show_toast("Enter = ascending, or D = descending")
+                self.begin_playlist_order_prompt()
+                return
+            self.close_overlay()
+            self.start_playlist_download(order)
+            return
+        if not url: return
+        if mode == "search":
+            self.start_background(self.search_youtube_worker, url)
+        elif mode == "youtube":
+            self.pending_youtube_url = url
+            self.play_youtube(url)
+        elif mode == "download":
+            self.download_url(url)
+        elif mode == "radio":
+            self.play_url(url, "RADIO")
+
+    def play_youtube(self, url):
+        if not is_url(url):
+            self.show_toast("Enter a complete URL")
+            return
+        if is_youtube_playlist_url(url):
+            self.show_toast("Playlist saved — press D to download")
+            return
+        self.start_background(self._play_youtube_worker, url)
+
+    def _play_youtube_worker(self, url):
+        title = self.get_youtube_title(url)
+        stream = self.resolve_youtube_stream(url)
+        if stream:
+            self.call_from_thread(self._load_external_track, Track(title, stream, "YOUTUBE", is_url=True))
+
+    def _load_external_track(self, track):
+        self.tracks.append(track)
+        self.current_index = len(self.tracks) - 1
+        self.start_track(track)
+        self.update_all()
+
+    def play_url(self, url, source="URL"):
+        name = url.split("?")[0].rstrip("/").split("/")[-1] or "Web stream"
+        self._load_external_track(Track(name, url, source, is_url=True))
+
+    def download_url(self, url):
+        if not is_youtube_url(url):
+            self.show_toast("D expects a YouTube URL")
+            return
+        if is_youtube_playlist_url(url):
+            self.playlist_source_url = url
+            self.start_background(self.scan_playlist_for_download, url)
+        else:
+            self.start_background(self.download_mp3, url)
+
+    def scan_playlist_for_download(self, url):
+        if not self.yt_ready(): return
+        self.call_from_thread(self.set_message, "Scanning YouTube playlist...")
+        self.call_from_thread(self.set_job, "YouTube playlist • connecting…", 0, 0, True)
+        proc = None
+        try:
+            # Print one flat entry per line. Unlike --dump-single-json this lets the UI
+            # receive playlist items progressively, so the user can see the list grow.
+            cmd = [YTDLP, "--flat-playlist", "--no-warnings", "--color", "never",
+                   "--print", "%(title)s\t%(webpage_url)s\t%(channel)s\t%(duration_string)s", url]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, universal_newlines=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            entries = []
+            started = time.monotonic()
+            for line in proc.stdout:
+                clean = line.strip()
+                if not clean:
+                    continue
+                parts = clean.split("\t")
+                if len(parts) >= 2 and is_url(parts[1]):
+                    entry = {
+                        "title": parts[0].strip() or "Video",
+                        "webpage_url": parts[1].strip(),
+                        "channel": parts[2].strip() if len(parts) > 2 else "YouTube",
+                        "duration_string": parts[3].strip() if len(parts) > 3 else "--:--",
+                    }
+                    entries.append(entry)
+                    count = len(entries)
+                    # Update the table continuously; users can see the available songs
+                    # before the complete playlist scan has finished.
+                    self.call_from_thread(self.show_playlist_entries_live, list(entries), count)
+                    self.call_from_thread(self.set_job, f"Playlist scanning • {count} videos found", 0, count, True)
+                elif time.monotonic() - started > 900:
+                    proc.kill()
+                    break
+            rc = proc.wait(timeout=10)
+            if not entries:
+                self.call_from_thread(self.set_error, "Playlist contains no readable videos")
+                return
+            out_dir = Path(os.path.expanduser(self.cfg.get("youtube_dir", "~/Music/YouTube")))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            pid = (parse_qs(urlparse(url).query).get("list") or ["playlist"])[0]
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", pid)[:80]
+            (out_dir / f"youtube_playlist_{safe}.json").write_text(
+                json.dumps({"entries": entries, "playlist_count": len(entries)}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if rc != 0:
+                self.call_from_thread(self.set_error, f"Playlist scan ended with code {rc}, but {len(entries)} videos were found")
+                return
+            self.call_from_thread(self.show_playlist_entries, entries)
+        except subprocess.TimeoutExpired:
+            if proc:
+                try: proc.kill()
+                except Exception: pass
+            self.call_from_thread(self.set_error, "Playlist scan timed out")
+        except Exception as e:
+            if proc:
+                try: proc.kill()
+                except Exception: pass
+            self.call_from_thread(self.set_error, f"Playlist error: {str(e)[:80]}")
+
+    def show_playlist_entries_live(self, entries, count):
+        self.playlist_entries = entries
+        self.online_results = entries
+        self.view_mode = "playlist_preview"
+        self.query_one("#playlist_title", Static).update(f"PLAYLIST VIDEOS   ({count} found)")
+        self.update_playlist()
+        self.refresh(layout=True)
+
+    def show_playlist_entries(self, entries):
+        self.playlist_entries = entries
+        self.playlist_count = None
+        self.playlist_selection = None
+        self.online_results = entries
+        self.view_mode = "playlist_preview"
+        self.set_job(f"Playlist ready • {len(entries)} videos • enter count / item numbers / all", len(entries), 0, True)
+        self.show_choice_input(
+            "playlist",
+            entries,
+            f"Select: count (5), items (1,5,7), or all — Enter"
+        )
+        self.update_playlist()
+
+    def show_choice_input(self, mode, items, placeholder):
+        self.choice_mode = mode
+        self.choice_items = list(items)
+        inp = self.query_one("#choice_input", Input)
+        inp.value = ""
+        inp.placeholder = placeholder
+        inp.add_class("show")
+        self.choice_input_active = True
+        inp.focus()
+        self.refresh(layout=True)
+
+    def hide_choice_input(self):
+        try:
+            inp = self.query_one("#choice_input", Input)
+            inp.value = ""
+            inp.remove_class("show")
+        except Exception:
+            pass
+        self.choice_mode = None
+        self.choice_items = []
+        self.choice_input_active = False
+
+    def handle_choice(self, text):
+        text = str(text or "").strip().lower()
+        if not self.choice_mode:
+            return
+
+        if self.choice_mode == "playlist_order":
+            if text in {"", "a", "asc", "ascending", "1"}:
+                order = "a"
+            elif text in {"d", "desc", "descending", "2"}:
+                order = "d"
+            else:
+                self.show_toast("Enter A for ascending or D for descending")
+                return
+            self.hide_choice_input()
+            self.start_playlist_download(order)
+            return
+
+        if self.choice_mode == "search":
+            if not text.isdigit():
+                self.show_toast(f"Enter one result number 1-{len(self.choice_items)}")
+                return
+            n = int(text)
+            if not 1 <= n <= len(self.choice_items):
+                self.show_toast(f"Choose 1-{len(self.choice_items)}")
+                return
+            self.choose_online_result(n - 1, download=True)
+            return
+
+        # Playlist selection: one number means a COUNT (first N), while comma
+        # separated values mean explicit item numbers. 'all' selects everything.
+        if text in {"", "all", "a"}:
+            selected = list(range(len(self.choice_items)))
+        elif re.fullmatch(r"\d+", text):
+            n = int(text)
+            if not 1 <= n <= len(self.choice_items):
+                self.show_toast(f"Enter count 1-{len(self.choice_items)}")
+                return
+            selected = list(range(n))
+        elif re.fullmatch(r"\d+(?:\s*,\s*\d+)*", text):
+            nums = [int(x.strip()) for x in text.split(",")]
+            if any(n < 1 or n > len(self.choice_items) for n in nums):
+                self.show_toast(f"Choose numbers 1-{len(self.choice_items)}")
+                return
+            seen = set(); selected = []
+            for n in nums:
+                if n not in seen:
+                    seen.add(n); selected.append(n - 1)
+        else:
+            self.show_toast("Use count (5), items (1,5,7), or all")
+            return
+
+        self.playlist_selection = selected
+        self.playlist_count = len(selected)
+        selected_entries = [self.choice_items[i] for i in selected]
+        self.set_job(f"Selected {len(selected_entries)} video(s) • choose download order", len(selected_entries), 0, True)
+        self.show_choice_input(
+            "playlist_order", selected_entries,
+            "Download order: A = ascending / D = descending"
+        )
+
+    def begin_playlist_prompt(self, entries):
+        self.show_playlist_entries(entries)
+
+    def begin_playlist_order_prompt(self):
+        self.show_choice_input(
+            "playlist_order",
+            [self.playlist_entries[i] for i in (self.playlist_selection or [])],
+            "Download order: A = ascending / D = descending"
+        )
+
+    def start_playlist_download(self, order):
+        entries = list(self.playlist_entries)
+        indices = list(self.playlist_selection or range(len(entries)))
+        selected = [entries[i] for i in indices if 0 <= i < len(entries)]
+        if order == "d":
+            selected.reverse()
+        if not selected:
+            self.show_toast("No videos selected")
+            return
+        self.set_job(f"Starting playlist download • 0/{len(selected)}", len(selected), 0, True)
+        self.start_background(self.download_playlist_entries, selected)
+
+    def _download_one(self, target, out_template, prefix, timeout=900):
+        # Use yt-dlp's standard progress output; --newline makes every update
+        # arrive as a line even when stdout is piped through Termux.
+        progress_template = (
+            "download:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|"
+            "%(progress._total_bytes_str)s|%(progress._speed_str)s|%(progress._eta_str)s"
+        )
+        cmd = [YTDLP, "--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+               "--embed-metadata", "--no-overwrites", "--color", "never", "--newline", "--progress",
+               "--progress-delta", "0.5", "--progress-template", progress_template,
+               "-o", out_template, target]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, universal_newlines=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        started = time.monotonic(); last_pct = -1; last_line = ""
+        try:
+            for line in proc.stdout:
+                if time.monotonic() - started > timeout:
+                    proc.kill()
+                    try: proc.wait(timeout=5)
+                    except Exception: pass
+                    return False, "timeout"
+                clean = line.strip()
+                if not clean:
+                    continue
+                template_match = re.match(r"download:([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)$", clean)
+                if template_match:
+                    pct_raw, downloaded, total_size, speed, eta = template_match.groups()
+                    m = re.search(r"(\d+(?:\.\d+)?)", pct_raw or "")
+                    pct = max(0, min(100, int(float(m.group(1))))) if m else 0
+                    detail = f"{pct_raw.strip() or str(pct) + '%'} • {downloaded or '?'} / {total_size or '?'} • {speed or '?'} • ETA {eta or '?'}"
+                    if len(detail) > 88:
+                        detail = detail[:85] + "..."
+                    if pct != last_pct or detail != last_line:
+                        last_pct, last_line = pct, detail
+                        self.call_from_thread(self.set_job, f"{prefix} • {pct}% • {detail}", None, None, True)
+                    continue
+                m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", clean)
+                if m:
+                    pct = max(0, min(100, int(float(m.group(1)))))
+                    detail = re.sub(r"\s+", " ", clean)
+                    if len(detail) > 82:
+                        detail = detail[:79] + "..."
+                    if pct != last_pct or detail != last_line:
+                        last_pct, last_line = pct, detail
+                        self.call_from_thread(self.set_job, f"{prefix} • {pct}% • {detail}", None, None, True)
+                elif any(token.lower() in clean.lower() for token in (
+                    "extractaudio", "metadata", "destination", "deleting original",
+                    "already been downloaded", "has already been downloaded",
+                )):
+                    detail = re.sub(r"\s+", " ", clean)
+                    if len(detail) > 90:
+                        detail = detail[:87] + "..."
+                    self.call_from_thread(self.set_job, f"{prefix} • working\n{detail}", None, None, True)
+            rc = proc.wait(timeout=10)
+            return rc == 0, ("ok" if rc == 0 else "failed")
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+            return False, "failed"
+
+    def _normalized_title(self, value):
+        text = str(value or "").casefold()
+        text = re.sub(r"\[[^]]*\]|\([^)]*\)|\{[^}]*\}", " ", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return " ".join(text.split())
+
+    def existing_music_titles(self):
+        """Return normalized audio stems from all configured music folders."""
+        titles = set()
+        dirs = self.cfg.get("music_dirs") or [self.cfg.get("music_dir", "~/Music")]
+        for directory in dirs:
+            root = Path(os.path.expanduser(str(directory)))
+            if not root.exists():
+                continue
+            try:
+                for f in root.rglob("*"):
+                    if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
+                        key = self._normalized_title(f.stem)
+                        if key:
+                            titles.add(key)
+            except OSError:
+                pass
+        return titles
+
+    def _entry_target(self, entry):
+        return entry.get("webpage_url") or entry.get("original_url") or (
+            f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get("id") else None
+        )
+
+    def download_playlist_entries(self, entries):
+        out_dir = Path(os.path.expanduser(self.cfg.get("youtube_dir", "~/Music/YouTube")))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        total = len(entries); completed = 0; failed = 0; skipped = 0
+        existing = self.existing_music_titles()
+        for n, e in enumerate(entries, 1):
+            target = self._entry_target(e)
+            title = (e.get("title") or "Video").strip() or "Video"
+            title_short = title[:58]
+            done = completed + skipped
+            if not target:
+                failed += 1
+                self.call_from_thread(self.set_job, f"Playlist {n}/{total} • FAILED\nNo video URL", total, completed + skipped, True)
+                continue
+            title_key = self._normalized_title(title)
+            if title_key and title_key in existing:
+                skipped += 1
+                self.call_from_thread(self.set_message, f"Skipping existing {n}/{total}: {title_short}")
+                self.call_from_thread(self.set_job, f"Playlist {n}/{total} • SKIP existing\n{title_short}", total, completed + skipped, True)
+                continue
+            self.call_from_thread(self.set_message, f"Downloading {n}/{total}: {title_short}")
+            self.call_from_thread(self.set_job, f"Playlist {n}/{total} • 0%\n{title_short}", total, done, True)
+            ok, reason = self._download_one(target, str(out_dir / "%(title)s.%(ext)s"), f"Playlist {n}/{total}")
+            if ok:
+                completed += 1
+                if title_key: existing.add(title_key)
+                self.call_from_thread(self.set_job, f"Playlist {n}/{total} • complete\n{title_short}", total, completed + skipped, True)
+            else:
+                failed += 1
+                result = "timed out" if reason == "timeout" else "FAILED"
+                self.call_from_thread(self.set_job, f"Playlist {n}/{total} • {result}\n{title_short}", total, completed + skipped, True)
+        self.call_from_thread(self.finish_download, completed, failed, skipped)
+
+    def download_mp3(self, url):
+        if not self.yt_ready(): return
+        if not command_exists(FFMPEG):
+            self.call_from_thread(self.show_toast, "ffmpeg is required"); return
+        out_dir = Path(os.path.expanduser(self.cfg.get("youtube_dir", "~/Music/YouTube"))); out_dir.mkdir(parents=True, exist_ok=True)
+        self.call_from_thread(self.set_message, "Downloading + converting to MP3...")
+        self.call_from_thread(self.set_job, "YouTube MP3 • 0%", 1, 0, True)
+        ok, reason = self._download_one(url, str(out_dir / "%(title)s.%(ext)s"), "YouTube MP3")
+        if not ok:
+            self.call_from_thread(self.set_error, "YouTube MP3 download failed" if reason != "timeout" else "Download timed out"); return
+        self.call_from_thread(self.finish_download, 1, 0, 0)
+
+    def download_urls(self, urls):
+        if not self.yt_ready(): return
+        out_dir = Path(os.path.expanduser(self.cfg.get("youtube_dir", "~/Music/YouTube")))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        total = len(urls); completed = 0; failed = 0; skipped = 0
+        existing = self.existing_music_titles()
+        for n, url in enumerate(urls, 1):
+            title = self.get_youtube_title(url)
+            title_key = self._normalized_title(title)
+            if title_key and title_key in existing:
+                skipped += 1
+                self.call_from_thread(self.set_job, f"Custom {n}/{total} • SKIP existing\n{title[:70]}", total, completed + skipped, True)
+                continue
+            self.call_from_thread(self.set_message, f"Custom list {n}/{total}: {title[:55]}")
+            self.call_from_thread(self.set_job, f"Custom {n}/{total} • 0%\n{title[:70]}", total, completed + skipped, True)
+            ok, _ = self._download_one(url, str(out_dir / "%(title)s.%(ext)s"), f"Custom {n}/{total}")
+            if ok:
+                completed += 1
+                if title_key: existing.add(title_key)
+            else:
+                failed += 1
+        self.call_from_thread(self.finish_download, completed, failed, skipped)
+
+    def finish_download(self, completed=0, failed=0, skipped=0):
+        self.rebuild_playlist(); self.status = "READY"
+        parts = [f"{completed} succeeded"]
+        if skipped: parts.append(f"{skipped} skipped")
+        if failed: parts.append(f"{failed} failed")
+        self.message = "Download complete: " + ", ".join(parts)
+        self.set_job(self.message, completed + skipped + failed, completed + skipped, False)
+        self.update_all(); self.show_toast(self.message)
+
+    def set_message(self, msg): self.message = str(msg); self.status = "WORKING"; self.update_info()
+    def set_error(self, msg): self.status = "ERROR"; self.message = msg; self.set_job(str(msg), show=False); self.update_info(); self.show_toast(msg)
+
+    def reload(self):
+        self.rebuild_playlist(); self.update_all(); self.show_toast(f"Library reloaded: {len(self.tracks)} tracks")
+
+    # ---------- search ----------
+    def on_input_changed(self, event: Input.Changed):
+        if event.input.id != "search": return
+        q = " ".join(event.value.casefold().split())
+        self.view_mode = "library"
+        def searchable(t):
+            return " ".join((t.name, t.artist or "", t.source, t.target)).casefold()
+        self.filtered_indices = [i for i, t in enumerate(self.tracks) if not q or q in searchable(t)]
+        self.update_playlist()
+        self.query_one("#playlist_title", Static).update(
+            f"PLAYLIST   ({len(self.filtered_indices)}/{len(self.tracks)} tracks)" if q else f"PLAYLIST   ({len(self.tracks)} tracks)"
+        )
+
+    def _play_table_key(self, row_key):
+        try:
+            value = str(getattr(row_key, "value", row_key))
+            if value.startswith("online:"):
+                idx = int(value.split(":", 1)[1])
+                self.choose_online_result(idx, download=True)
+            else:
+                self.play_index(int(value))
+        except Exception as exc:
+            self.show_toast(f"Unable to play row: {str(exc)[:40]}")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        self._play_table_key(event.row_key)
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected):
+        # Current Textual releases may emit CellSelected for pointer/touch activation.
+        self._play_table_key(event.cell_key.row_key)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
+        # Highlighting is navigation only; it never starts audio.
+        return
+
+
+    # ---------- buttons/touch ----------
+    def on_button_pressed(self, event: Button.Pressed):
+        bid = event.button.id or ""
+        if bid in {"play_button", "quick-play"}: self.toggle_play()
+        elif bid in {"next", "quick-next"}: self.next_track()
+        elif bid in {"previous", "quick-prev"}: self.previous_track()
+        elif bid in {"shuffle", "quick-shuffle"}: self.toggle_shuffle()
+        elif bid in {"repeat", "quick-repeat"}: self.toggle_repeat()
+        elif bid == "quick-youtube" or bid == "nav-youtube": self.youtube()
+        elif bid == "quick-download": self.download()
+        elif bid == "quick-custom": self.custom()
+        elif bid == "quick-vol-up": self.change_volume(5)
+        elif bid == "quick-vol-down": self.change_volume(-5)
+        elif bid == "volume_button": self.mute()
+        elif bid == "nav-radio": self.add()
+        elif bid == "nav-help": self.help()
+        elif bid == "nav-quit": self.quit_app()
+        elif bid == "nav-playlist": self.activate_nav("nav-playlist", "#search")
+        elif bid == "nav-search": self.activate_nav("nav-search"); self.search_online()
+        elif bid in {"nav-now", "nav-browse", "nav-library", "nav-settings"}: self.activate_nav(bid)
+
+    def activate_nav(self, active_id, focus_id=None):
+        for b in self.query(".nav_button"):
+            b.remove_class("nav_active")
+        try: self.query_one(f"#{active_id}").add_class("nav_active")
+        except Exception: pass
+        if focus_id:
+            try: self.query_one(focus_id).focus()
+            except Exception: pass
+
+    def on_progress_click(self, event: Click):
+        if event.button != 1: return
+        widget = self.query_one("#progress")
+        width = max(1, widget.region.width)
+        # Local click coordinates are available on Textual's Click event.
+        ratio = max(0.0, min(1.0, event.x / max(1, width - 1)))
+        self.seek_absolute(ratio)
+
+    # Textual dispatches click events to the Static itself; keeping this explicit
+    # handler makes the progress bar touch target independent of the Button widgets.
+    def on_click(self, event: Click):
+        if event.widget.id == "progress":
+            self.on_progress_click(event)
+
+    # ---------- overlays/help ----------
+    def help(self):
+        self.overlay_mode = "help"
+        self.query_one("#overlay_title", Static).update("GREEN MUSIC — KEYS")
+        self.query_one("#overlay_input", Input).display = False
+        self.query_one("#overlay_hint", Static).update(
+            "SPACE play/pause   N next   P previous   ←/→ seek 10s   ↑/↓ volume\n"
+            "S search YouTube   F shuffle   R repeat   M mute\n"
+            "Y YouTube URL   D MP3 download   C custom.txt\n"
+            "L reload library   A radio/direct URL   Q quit   ESC close"
+        )
+        self.query_one("#overlay").add_class("show")
+
+    def on_key(self, event):
+        if event.key == "escape" and self.overlay_mode:
+            self.close_overlay()
+            return
+        if event.key == "escape" and self.choice_mode:
+            self.hide_choice_input()
+            self.view_mode = "library"
+            self.update_playlist()
+
+    # ---------- helpers ----------
+    def poll_player(self):
+        """Poll only the small set of mpv properties needed by the UI.
+
+        Keeping these values cached is important on slower Ubuntu/VirtualBox
+        terminals: the render loop must never perform many long IPC reads.
+        """
+        if not self.mpv.sock or not self.current():
+            return
+        try:
+            pos = self.mpv.get("time-pos", self.player_pos)
+            dur = self.mpv.get("duration", self.player_duration)
+            pause = self.mpv.get("pause", self.player_pause)
+            eof = self.mpv.get("eof-reached", self.player_eof)
+            path = self.mpv.get("path", self.player_path)
+            self.player_pos = self.safe_float(pos, self.player_pos)
+            self.player_duration = self.safe_float(dur, self.player_duration)
+            self.player_pause = bool(pause)
+            self.player_eof = bool(eof)
+            self.player_path = path or self.player_path
+            self.playing = not self.player_pause
+        except Exception:
+            return
+        if self.player_eof and not self._last_eof and self._last_play_request > 0:
+            if self.repeat_mode == "one":
+                self.start_track(self.current())
+            elif self.repeat_mode == "all":
+                self.next_track()
+            elif self.repeat_mode == "off":
+                self.playing = False
+                self.status = "READY"
+                self.message = "End of track"
+        self._last_eof = self.player_eof
+        self.draw_progress()
+        self.update_info()
+        self.update_control_state()
+
+    def next_name(self):
+        if not self.tracks: return "-"
+        return self.tracks[(self.current_index + 1) % len(self.tracks)].name
+
+    @staticmethod
+    def safe_float(value, default=0.0):
+        try:
+            x = float(value)
+            return x if math.isfinite(x) else default
+        except Exception: return default
+
+    @staticmethod
+    def parse_time(value):
+        if not value or value == "--:--": return 0
+        try:
+            p = str(value).split(":")
+            return int(p[-1]) + 60 * int(p[-2]) if len(p) >= 2 else float(p[0])
+        except Exception: return 0
+
+    @classmethod
+    def format_time(cls, value):
+        if value is None: return "--:--"
+        if isinstance(value, str):
+            if value == "--:--": return value
+            value = cls.parse_time(value)
+        try:
+            v = float(value)
+            if not math.isfinite(v) or v < 0: return "--:--"
+            s = int(v); return f"{s // 60:02d}:{s % 60:02d}"
+        except Exception: return "--:--"
+
+    def show_toast(self, text, seconds=1.8):
+        if not self.is_mounted:
+            return
+        try:
+            self.notify(str(text), title="GREEN MUSIC", severity="information", timeout=seconds)
+        except Exception:
+            self.message = str(text)
+
+    def quit_app(self):
+        self.exit()
+
+    def action_toggle_play(self): self.toggle_play()
+    def action_seek_forward(self): self.seek(10)
+    def action_seek_back(self): self.seek(-10)
+    def action_volume_up(self): self.change_volume(5)
+    def action_volume_down(self): self.change_volume(-5)
+    def action_next_track(self): self.next_track()
+    def action_previous_track(self): self.previous_track()
+    def action_shuffle(self): self.toggle_shuffle()
+    def action_search_online(self): self.search_online()
+    def action_repeat(self): self.toggle_repeat()
+    def action_mute(self): self.mute()
+    def action_youtube(self): self.youtube()
+    def action_download(self): self.download()
+    def action_custom(self): self.custom()
+    def action_reload(self): self.reload()
+    def action_help(self): self.help()
+    def action_add(self): self.add()
+    def action_quit_app(self): self.quit_app()
+
+
+def main():
+    if os.name != "posix":
+        print("Green Music is designed for Termux/Linux terminals.")
+        return 1
+    GreenMusic().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
