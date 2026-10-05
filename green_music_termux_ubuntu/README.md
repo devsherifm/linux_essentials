@@ -130,8 +130,8 @@ ESC       Close current prompt / overlay
 ## Ubuntu 24.04+
 
 ```bash
-unzip green_music_termux_ubuntu_v7.5.zip
-cd green_music_termux_ubuntu_v7.5
+git clone https://github.com/devsherifm/linux_essentials.git
+cd linux_essentials/green_music_termux_ubuntu
 chmod +x *.sh
 ./install.sh
 green-music
@@ -142,8 +142,8 @@ green-music
 Use the same installation:
 
 ```bash
-unzip green_music_termux_ubuntu_v7.5.zip
-cd green_music_termux_ubuntu_v7.5
+git clone https://github.com/devsherifm/linux_essentials.git
+cd linux_essentials/green_music_termux_ubuntu
 chmod +x *.sh
 ./install.sh
 green-music
@@ -152,8 +152,8 @@ green-music
 ## Termux
 
 ```bash
-unzip green_music_termux_ubuntu_v7.5.zip
-cd green_music_termux_ubuntu_v7.5
+git clone https://github.com/devsherifm/linux_essentials.git
+cd linux_essentials/green_music_termux_ubuntu
 chmod +x *.sh
 ./install.sh
 green-music
@@ -170,8 +170,9 @@ termux-setup-storage
 The same package can be installed inside a Linux userspace running through Termux/PRoot:
 
 ```bash
-unzip green_music_termux_ubuntu_v7.5.zip
-cd green_music_termux_ubuntu_v7.5
+proot-distor login ubuntu
+git clone https://github.com/devsherifm/linux_essentials.git
+cd linux_essentials/green_music_termux_ubuntu
 chmod +x *.sh
 ./install.sh
 green-music
